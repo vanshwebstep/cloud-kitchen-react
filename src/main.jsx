@@ -190,18 +190,14 @@ function getKitchenSubscription(kitchen) {
 
 function hasSelectedSubscription(apiState) {
   const kitchen = apiState?.kitchen || {};
+  const selectedPlan = apiState?.selectedPlan;
   const subscription = getKitchenSubscription(kitchen);
+  const subscriptions = Array.isArray(kitchen.subscriptions) ? kitchen.subscriptions : [];
   return Boolean(
-    apiState?.selectedPlan ||
-    subscription?.id ||
-    subscription?.subscriptionId ||
-    kitchen.subscriptionId ||
-    kitchen.subscriptionPlanId ||
-    truthyFlag(kitchen.hasActiveSubscription) ||
-    truthyFlag(kitchen.isSubscriptionActive) ||
-    truthyFlag(kitchen.isSubscribed) ||
-    truthyFlag(kitchen.planSelected) ||
-    String(kitchen.subscriptionStatus || subscription?.status || "").toUpperCase() === "ACTIVE"
+    selectedPlan?.confirmedActive ||
+    selectedPlan?.alreadyActive ||
+    String(subscription?.status || "").toUpperCase() === "ACTIVE" ||
+    subscriptions.some((item) => String(item?.status || "").toUpperCase() === "ACTIVE")
   );
 }
 
@@ -352,7 +348,7 @@ function App() {
     setStoredToken(token);
     updateApiState({ token, kitchen, online: true, message: "Logged in" });
     setDesktopAuthMode("login");
-    setPage(isKitchenOnboardingCompleted(kitchen) ? "Ingredient Add" : "Onboarding");
+    setPage(isKitchenOnboardingCompleted(kitchen) ? "Subscription Plans" : "Onboarding");
     await refreshKitchenData(token, kitchen);
     return response;
   };
@@ -374,12 +370,12 @@ function App() {
   const handleOnboardingCompleted = async () => {
     const kitchen = await reloadKitchenProfile({ isOnboardingCompleted: true });
     updateApiState({ message: "Onboarding completed. Select a subscription plan." });
-    setPage(hasSelectedSubscription({ ...apiState, kitchen }) ? "Ingredient Add" : "Subscription Plans");
+    setPage("Subscription Plans");
   };
 
   const handlePlanSelected = async (plan) => {
     const kitchen = await reloadKitchenProfile({});
-    updateApiState({ selectedPlan: plan, kitchen, message: "Subscription plan selected." });
+    updateApiState({ selectedPlan: { ...plan, confirmedActive: true }, kitchen, message: "Subscription plan selected." });
     setPage("Ingredient Add");
     await refreshKitchenData(apiState.token, kitchen);
   };
@@ -1517,7 +1513,7 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
         billingCycle: plan.billingCycle || billingCycle,
         duration: Number(plan.duration || plan.durationInMonths || 1),
       });
-      await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle });
+      await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle, confirmedActive: true });
     } catch (error) {
       const messageText = getApiErrorMessage(error, "Unable to select subscription plan");
       if (messageText.toLowerCase().includes("active subscription already exists")) {
