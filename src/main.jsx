@@ -1468,10 +1468,13 @@ function FileField({ label, file, onChange }) {
 function SubscriptionPlansPage({ plans, onPlanSelected }) {
   const [planList, setPlanList] = useState(Array.isArray(plans) ? plans : []);
   const [selectedPlanId, setSelectedPlanId] = useState(planList[0]?.id ? String(planList[0].id) : "");
+  const [paymentPlan, setPaymentPlan] = useState(null);
   const [billingCycle, setBillingCycle] = useState("MONTHLY");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [paymentForm, setPaymentForm] = useState({ name: "", cardNumber: "", expiry: "", cvc: "", postalCode: "" });
+  const updatePayment = (key) => (event) => setPaymentForm((current) => ({ ...current, [key]: event.target.value }));
 
   useEffect(() => {
     let active = true;
@@ -1503,21 +1506,46 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
     }
   }, [plans]);
 
-  const selectPlan = async (plan) => {
+  const openPayment = (plan) => {
     setSelectedPlanId(String(plan.id));
-    setSaving(true);
+    setPaymentPlan(plan);
     setMessage("");
+  };
+
+  const validateDemoPayment = () => {
+    const digits = paymentForm.cardNumber.replace(/\D/g, "");
+    if (!paymentForm.name.trim()) return "Card holder name is required.";
+    if (digits.length < 12) return "Enter a valid demo card number.";
+    if (!/^\d{2}\s*\/\s*\d{2}$/.test(paymentForm.expiry.trim())) return "Expiry must be in MM/YY format.";
+    if (!/^\d{3,4}$/.test(paymentForm.cvc.trim())) return "CVC must be 3 or 4 digits.";
+    if (!paymentForm.postalCode.trim()) return "Postal code is required.";
+    return "";
+  };
+
+  const activatePlan = async (event) => {
+    event.preventDefault();
+    if (!paymentPlan?.id) {
+      setMessage("Select a plan first.");
+      return;
+    }
+    const validationMessage = validateDemoPayment();
+    if (validationMessage) {
+      setMessage(validationMessage);
+      return;
+    }
+    setSaving(true);
+    setMessage("Demo Stripe payment authorized. Activating subscription...");
     try {
       await api.selectPlan({
-        subscriptionId: Number(plan.id),
-        billingCycle: plan.billingCycle || billingCycle,
-        duration: Number(plan.duration || plan.durationInMonths || 1),
+        subscriptionId: Number(paymentPlan.id),
+        billingCycle: paymentPlan.billingCycle || billingCycle,
+        duration: Number(paymentPlan.duration || paymentPlan.durationInMonths || 1),
       });
-      await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle, confirmedActive: true });
+      await onPlanSelected?.({ ...paymentPlan, billingCycle: paymentPlan.billingCycle || billingCycle, confirmedActive: true, demoPayment: true });
     } catch (error) {
-      const messageText = getApiErrorMessage(error, "Unable to select subscription plan");
+      const messageText = getApiErrorMessage(error, "Unable to activate subscription plan");
       if (messageText.toLowerCase().includes("active subscription already exists")) {
-        await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle, alreadyActive: true });
+        await onPlanSelected?.({ ...paymentPlan, billingCycle: paymentPlan.billingCycle || billingCycle, alreadyActive: true, demoPayment: true });
         return;
       }
       setMessage(messageText);
@@ -1531,7 +1559,7 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
       <div className="mb-7 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-3xl font-semibold text-[#8D0606]">Subscription Plans</h2>
-          <p className="mt-2 text-base text-[#777]">Plans are loaded from the subscription listing API. Select one plan to continue.</p>
+          <p className="mt-2 text-base text-[#777]">Select a plan, complete demo Stripe payment, then subscription record will be saved.</p>
         </div>
         <div className="flex rounded-md border border-[#ececec] p-1 text-sm font-bold">
           {["MONTHLY", "YEARLY"].map((cycle) => (
@@ -1540,42 +1568,68 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
         </div>
       </div>
 
-      {loading ? (
-        <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">Loading subscription plans...</div>
-      ) : planList.length ? (
-        <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-          {planList.map((plan) => {
-            const active = String(plan.id) === selectedPlanId;
-            return (
-              <article key={plan.id || getPlanTitle(plan)} className={`rounded-md border bg-white p-6 shadow-sm ${active ? "border-[#8D0606]" : "border-[#ececec]"}`}>
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <h3 className="text-xl font-semibold">{getPlanTitle(plan)}</h3>
-                    <p className="mt-2 text-2xl font-bold text-[#8D0606]">{getPlanPrice(plan)}</p>
-                  </div>
-                  {active ? <span className="rounded-full bg-[#fff1f1] px-3 py-1 text-xs font-bold text-[#8D0606]">Selected</span> : null}
-                </div>
-                <p className="mt-4 min-h-[48px] text-sm leading-6 text-[#777]">{plan.description || plan.shortDescription || "Kitchen subscription plan"}</p>
-                <div className="mt-5 grid gap-2 text-sm text-[#555]">
-                  <span>Duration: {plan.duration || plan.durationInMonths || 1}</span>
-                  <span>Cycle: {plan.billingCycle || billingCycle}</span>
-                  <span>Status: {plan.status || "Available"}</span>
-                </div>
-                <button className="mt-6 h-11 w-full rounded-md bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={saving} onClick={() => selectPlan(plan)} type="button">
-                  {saving && active ? "Selecting..." : "Select Plan"}
-                </button>
-              </article>
-            );
-          })}
+      <div className="grid gap-7 xl:grid-cols-[1fr_420px]">
+        <div>
+          {loading ? (
+            <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">Loading subscription plans...</div>
+          ) : planList.length ? (
+            <div className="grid gap-5 md:grid-cols-2">
+              {planList.map((plan) => {
+                const active = String(plan.id) === selectedPlanId;
+                return (
+                  <article key={plan.id || getPlanTitle(plan)} className={`rounded-md border bg-white p-6 shadow-sm ${active ? "border-[#8D0606]" : "border-[#ececec]"}`}>
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h3 className="text-xl font-semibold">{getPlanTitle(plan)}</h3>
+                        <p className="mt-2 text-2xl font-bold text-[#8D0606]">{getPlanPrice(plan)}</p>
+                      </div>
+                      {active ? <span className="rounded-full bg-[#fff1f1] px-3 py-1 text-xs font-bold text-[#8D0606]">Selected</span> : null}
+                    </div>
+                    <p className="mt-4 min-h-[48px] text-sm leading-6 text-[#777]">{plan.description || plan.shortDescription || "Kitchen subscription plan"}</p>
+                    <div className="mt-5 grid gap-2 text-sm text-[#555]">
+                      <span>Duration: {plan.duration || plan.durationInMonths || 1}</span>
+                      <span>Cycle: {plan.billingCycle || billingCycle}</span>
+                      <span>Status: {plan.status || "Available"}</span>
+                    </div>
+                    <button className="mt-6 h-11 w-full rounded-md bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={saving} onClick={() => openPayment(plan)} type="button">
+                      Pay with Demo Stripe
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">No subscription plans returned from API.</div>
+          )}
         </div>
-      ) : (
-        <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">No subscription plans returned from API.</div>
-      )}
-      {message ? <p className="mt-5 whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
+
+        <div className="rounded-md border border-[#ececec] bg-white p-6 shadow-sm">
+          <div className="mb-5 flex items-center gap-3">
+            <span className="grid size-11 place-items-center rounded-md bg-[#fff1f1] text-[#8D0606]"><CreditCard size={22} /></span>
+            <div>
+              <h3 className="text-xl font-semibold">Demo Stripe Payment</h3>
+              <p className="text-sm text-[#777]">{paymentPlan ? getPlanTitle(paymentPlan) : "Select a plan to continue"}</p>
+            </div>
+          </div>
+          <form className="grid gap-4" onSubmit={activatePlan}>
+            <Field label="Name on Card *" placeholder="Demo User" value={paymentForm.name} onChange={updatePayment("name")} />
+            <Field label="Card Number *" placeholder="4242 4242 4242 4242" value={paymentForm.cardNumber} onChange={updatePayment("cardNumber")} />
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="Expiry *" placeholder="12/34" value={paymentForm.expiry} onChange={updatePayment("expiry")} />
+              <Field label="CVC *" placeholder="123" value={paymentForm.cvc} onChange={updatePayment("cvc")} />
+            </div>
+            <Field label="Postal Code *" placeholder="110001" value={paymentForm.postalCode} onChange={updatePayment("postalCode")} />
+            <button className="h-12 rounded-md bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={saving || !paymentPlan} type="submit">
+              {saving ? "Processing..." : "Pay Demo & Activate"}
+            </button>
+          </form>
+          {message ? <p className="mt-5 whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
+          <p className="mt-4 text-xs leading-5 text-[#777]">Demo card details are not sent to the backend. Activation uses the subscription select API so the subscription record is saved.</p>
+        </div>
+      </div>
     </Card>
   );
 }
-
 function IngredientSetupPage({ apiState, refreshKitchenData, selectedPlan }) {
   const branchOptions = apiState?.branches?.map((branch) => ({ value: branch.id, label: branch.name || `Branch ${branch.id}` })) || [];
   const firstBranchId = branchOptions[0]?.value ? String(branchOptions[0].value) : "";
