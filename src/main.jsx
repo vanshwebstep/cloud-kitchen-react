@@ -43,6 +43,7 @@ const blue = "#63a9e8";
 
 const sidebarItems = [
   { label: "Dashboard", icon: Grid2X2 },
+  { label: "Ingredient Add", icon: ClipboardList },
   { label: "Analytics", icon: BarChart3 },
   { label: "Review", icon: TrendingUp },
   { label: "Order", icon: Star },
@@ -73,29 +74,6 @@ function createProfileFile(name = "profile.txt") {
   return new File([new Blob(["profile"], { type: "text/plain" })], name, { type: "text/plain" });
 }
 
-async function ensureKitchenSetup(planId = 1) {
-  try {
-    await api.onboarding({
-      fssaiNumber: "12345678901234",
-      fssaiFile: createProfileFile("fssai.txt"),
-      gstNumber: "",
-    });
-  } catch (error) {
-    const message = getApiErrorMessage(error, "");
-    if (!message.toLowerCase().includes("already")) throw error;
-  }
-
-  try {
-    await api.selectPlan({
-      subscriptionId: Number(planId) || 1,
-      billingCycle: "MONTHLY",
-      duration: 1,
-    });
-  } catch (error) {
-    const message = getApiErrorMessage(error, "");
-    if (!message.toLowerCase().includes("active subscription")) throw error;
-  }
-}
 
 const foodImages = [
   foodCollage,
@@ -182,6 +160,69 @@ const loyalCustomers = [
   ["Kevin Jamet", "78 Times order", "bg-orange-100"],
 ];
 
+function truthyFlag(value) {
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true" || String(value).toUpperCase() === "YES";
+}
+
+function isKitchenOnboardingCompleted(kitchen) {
+  if (!kitchen) return false;
+  return truthyFlag(
+    kitchen.isOnboardingCompleted ??
+    kitchen.isOnboardinfCompleted ??
+    kitchen.onboardingCompleted ??
+    kitchen.onboarding?.isCompleted ??
+    kitchen.onboarding?.completed
+  );
+}
+
+function getKitchenSubscription(kitchen) {
+  if (!kitchen) return null;
+  return (
+    kitchen.activeSubscription ||
+    kitchen.currentSubscription ||
+    kitchen.subscription ||
+    kitchen.subscriptionPlan ||
+    kitchen.plan ||
+    kitchen.selectedSubscription ||
+    null
+  );
+}
+
+function hasSelectedSubscription(apiState) {
+  const kitchen = apiState?.kitchen || {};
+  const subscription = getKitchenSubscription(kitchen);
+  return Boolean(
+    apiState?.selectedPlan ||
+    subscription?.id ||
+    subscription?.subscriptionId ||
+    kitchen.subscriptionId ||
+    kitchen.subscriptionPlanId ||
+    truthyFlag(kitchen.hasActiveSubscription) ||
+    truthyFlag(kitchen.isSubscriptionActive) ||
+    truthyFlag(kitchen.isSubscribed) ||
+    truthyFlag(kitchen.planSelected) ||
+    String(kitchen.subscriptionStatus || subscription?.status || "").toUpperCase() === "ACTIVE"
+  );
+}
+
+function getRequiredSetupStep(apiState) {
+  if (!apiState?.token) return "";
+  if (!isKitchenOnboardingCompleted(apiState.kitchen)) return "onboarding";
+  if (!hasSelectedSubscription(apiState)) return "subscription";
+  return "";
+}
+
+function getPlanTitle(plan) {
+  return plan?.name || plan?.title || plan?.planName || plan?.subscriptionName || `Plan #${plan?.id || ""}`;
+}
+
+function getPlanPrice(plan) {
+  const amount = plan?.price ?? plan?.amount ?? plan?.monthlyPrice ?? plan?.planPrice;
+  if (amount === undefined || amount === null || amount === "") return "Custom";
+  const currency = plan?.currency || plan?.currencyCode || "INR";
+  return `${currency} ${amount}`;
+}
+
 function App() {
   const [page, setPage] = useState("Dashboard");
   const [toast, setToast] = useState("");
@@ -201,6 +242,7 @@ function App() {
     countries: [],
     states: [],
     cities: [],
+    selectedPlan: null,
     loading: true,
   });
 
@@ -310,13 +352,41 @@ function App() {
     setStoredToken(token);
     updateApiState({ token, kitchen, online: true, message: "Logged in" });
     setDesktopAuthMode("login");
+    setPage(isKitchenOnboardingCompleted(kitchen) ? "Ingredient Add" : "Onboarding");
     await refreshKitchenData(token, kitchen);
     return response;
   };
 
+  const reloadKitchenProfile = async (fallbackPatch = {}) => {
+    const token = getStoredToken();
+    const fallbackKitchen = { ...(apiState.kitchen || {}), ...fallbackPatch };
+    try {
+      const verified = await api.verify(token);
+      const verifiedKitchen = verified?.kitchen || verified?.data?.kitchen || fallbackKitchen;
+      updateApiState({ kitchen: { ...verifiedKitchen, ...fallbackPatch } });
+      return { ...verifiedKitchen, ...fallbackPatch };
+    } catch {
+      updateApiState({ kitchen: fallbackKitchen });
+      return fallbackKitchen;
+    }
+  };
+
+  const handleOnboardingCompleted = async () => {
+    const kitchen = await reloadKitchenProfile({ isOnboardingCompleted: true });
+    updateApiState({ message: "Onboarding completed. Select a subscription plan." });
+    setPage(hasSelectedSubscription({ ...apiState, kitchen }) ? "Ingredient Add" : "Subscription Plans");
+  };
+
+  const handlePlanSelected = async (plan) => {
+    const kitchen = await reloadKitchenProfile({});
+    updateApiState({ selectedPlan: plan, kitchen, message: "Subscription plan selected." });
+    setPage("Ingredient Add");
+    await refreshKitchenData(apiState.token, kitchen);
+  };
+
   const handleLogout = () => {
     setStoredToken("");
-    updateApiState({ token: "", kitchen: null, branches: [], menus: [], branchIngredients: [], stocks: [], message: "Logged out" });
+    updateApiState({ token: "", kitchen: null, branches: [], menus: [], branchIngredients: [], stocks: [], selectedPlan: null, message: "Logged out" });
     setPage("Dashboard");
     setDesktopAuthMode("login");
     setToast("Logged out");
@@ -332,6 +402,9 @@ function App() {
     }));
   }, [apiState.menus]);
 
+  const requiredSetupStep = getRequiredSetupStep(apiState);
+  const visiblePage = requiredSetupStep === "onboarding" ? "Onboarding" : requiredSetupStep === "subscription" ? "Subscription Plans" : page;
+
   return (
     <div className="min-h-screen bg-[#F7F6F6] text-[#191919]">
       <div className="lg:hidden">
@@ -340,31 +413,41 @@ function App() {
       <div className="hidden min-h-screen lg:flex">
         {!apiState.token ? (
           <DesktopAuthPage mode={desktopAuthMode} setMode={setDesktopAuthMode} onLogin={handleLogin} />
+        ) : requiredSetupStep ? (
+          <SetupFlowPage
+            step={requiredSetupStep}
+            apiState={apiState}
+            onLogout={handleLogout}
+            onOnboardingCompleted={handleOnboardingCompleted}
+            onPlanSelected={handlePlanSelected}
+          />
         ) : (
           <>
-            <Sidebar page={page} setPage={setPage} />
+            <Sidebar page={visiblePage} setPage={setPage} />
             <main className="min-w-0 flex-1 lg:pl-[300px]">
-              <Topbar title={page} apiState={apiState} onLogout={handleLogout} setPage={setPage} onToast={setToast} onLogin={handleLogin} refreshKitchenData={refreshKitchenData} />
+              <Topbar title={visiblePage} apiState={apiState} onLogout={handleLogout} setPage={setPage} onToast={setToast} onLogin={handleLogin} refreshKitchenData={refreshKitchenData} />
               <div className="page-shell px-5 py-7 sm:px-8 lg:px-10">
-                {page === "Analytics" ? (
+                {visiblePage === "Analytics" ? (
                   <AnalyticsPage setPage={setPage} />
-                ) : page === "Order" ? (
+                ) : visiblePage === "Order" ? (
                   <OrderPage setPage={setPage} />
-                ) : page === "Order List" ? (
+                ) : visiblePage === "Order List" ? (
                   <OrderListPage setPage={setPage} />
-                ) : page === "Customer List" ? (
+                ) : visiblePage === "Customer List" ? (
                   <CustomerListPage setPage={setPage} />
-                ) : page === "Category" ? (
+                ) : visiblePage === "Category" ? (
                   <CategoryPage setPage={setPage} liveMenuItems={liveMenuItems} apiState={apiState} />
-                ) : page === "Add Menu" ? (
+                ) : visiblePage === "Add Menu" ? (
                   <AddMenuPage setPage={setPage} apiState={apiState} refreshKitchenData={refreshKitchenData} />
-                ) : page === "Customer Review" ? (
+                ) : visiblePage === "Customer Review" ? (
                   <CustomerReviewPage />
-                ) : page === "Add / Edit Kitchen" ? (
+                ) : visiblePage === "Add / Edit Kitchen" ? (
                   <KitchenFormPage setPage={setPage} apiState={apiState} refreshKitchenData={refreshKitchenData} />
-                ) : page === "Icons" ? (
+                ) : visiblePage === "Ingredient Add" ? (
+                  <IngredientSetupPage apiState={apiState} refreshKitchenData={refreshKitchenData} selectedPlan={apiState.selectedPlan || getKitchenSubscription(apiState.kitchen)} />
+                ) : visiblePage === "Icons" ? (
                   <UtilityPage title="Icons" subtitle="Reusable action icons and quick links for the kitchen app." setPage={setPage} />
-                ) : page === "Table" ? (
+                ) : visiblePage === "Table" ? (
                   <UtilityPage title="Table" subtitle="Compact restaurant data table preview." setPage={setPage} />
                 ) : (
                   <DashboardPage setPage={setPage} apiState={apiState} />
@@ -402,7 +485,7 @@ function Sidebar({ page, setPage }) {
                 if (item.label === "Foods") return setPage("Category");
                 if (item.label === "Review") return setPage("Customer Review");
                 if (item.label === "forms") return setPage("Add / Edit Kitchen");
-                if (["Dashboard", "Analytics", "Order", "Order List", "Customer List", "Icons", "Table", "Add Menu"].includes(item.label)) return setPage(item.label);
+                if (["Dashboard", "Ingredient Add", "Analytics", "Order", "Order List", "Customer List", "Icons", "Table", "Add Menu"].includes(item.label)) return setPage(item.label);
                 return null;
               }}
               type="button"
@@ -1282,6 +1365,302 @@ function ResetPasswordModal({ onClose, onToast }) {
   );
 }
 
+function SetupFlowPage({ step, apiState, onLogout, onOnboardingCompleted, onPlanSelected }) {
+  return (
+    <main className="min-h-screen flex-1 bg-[#F7F6F6] px-6 py-7">
+      <div className="mx-auto flex max-w-[1180px] items-center justify-between rounded-md bg-white px-6 py-4 shadow-sm">
+        <div className="flex items-center gap-4">
+          <img src="./assets/logo.png" alt="" className="size-14" />
+          <div>
+            <h1 className="text-2xl font-semibold text-[#8D0606]">Cloud Kitchen Setup</h1>
+            <p className="text-sm text-[#777]">{apiState?.kitchen?.kitchenName || apiState?.kitchen?.email || "Complete your kitchen registration"}</p>
+          </div>
+        </div>
+        <button className="rounded-full bg-[#fff1f1] px-5 py-2 font-bold text-[#8D0606]" onClick={onLogout} type="button">Logout</button>
+      </div>
+
+      <div className="mx-auto mt-7 grid max-w-[1180px] gap-7 lg:grid-cols-[300px_1fr]">
+        <Card className="h-fit p-6">
+          <div className="space-y-4">
+            <SetupStep number="1" label="Onboarding" active={step === "onboarding"} done={isKitchenOnboardingCompleted(apiState?.kitchen)} />
+            <SetupStep number="2" label="Subscription" active={step === "subscription"} done={hasSelectedSubscription(apiState)} />
+            <SetupStep number="3" label="Ingredient Add" active={false} done={false} />
+          </div>
+        </Card>
+
+        {step === "onboarding" ? (
+          <OnboardingPage onComplete={onOnboardingCompleted} />
+        ) : (
+          <SubscriptionPlansPage plans={apiState?.plans || []} onPlanSelected={onPlanSelected} />
+        )}
+      </div>
+    </main>
+  );
+}
+
+function SetupStep({ number, label, active, done }) {
+  return (
+    <div className={`flex items-center gap-4 rounded-md border px-4 py-3 ${active ? "border-[#8D0606] bg-[#fff1f1]" : done ? "border-[#ccebd6] bg-[#f3fbf6]" : "border-[#ececec] bg-white"}`}>
+      <span className={`grid size-9 place-items-center rounded-full text-sm font-bold ${done ? "bg-[#2fc65b] text-white" : active ? "bg-[#8D0606] text-white" : "bg-[#f3f3f3] text-[#777]"}`}>{done ? <Check size={18} /> : number}</span>
+      <span className="font-semibold">{label}</span>
+    </div>
+  );
+}
+
+function OnboardingPage({ onComplete }) {
+  const [form, setForm] = useState({ fssaiNumber: "", fssaiFile: null, gstNumber: "", gstFile: null });
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+  const updateText = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.value }));
+  const updateFile = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.files?.[0] || null }));
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!form.fssaiNumber || !form.fssaiFile || !form.gstNumber || !form.gstFile) {
+      setMessage("FSSAI number, FSSAI file, GST number and GST file are required.");
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    try {
+      await api.onboarding(form);
+      await onComplete?.();
+    } catch (error) {
+      setMessage(getApiErrorMessage(error, "Onboarding failed"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="p-8">
+      <div className="mb-7">
+        <h2 className="text-3xl font-semibold text-[#8D0606]">Onboarding</h2>
+        <p className="mt-2 text-base text-[#777]">FSSAI and GST details are mandatory before kitchen setup can continue.</p>
+      </div>
+      <form className="grid gap-5" onSubmit={submit}>
+        <div className="grid gap-5 md:grid-cols-2">
+          <Field label="FSSAI Number *" placeholder="Enter FSSAI number" value={form.fssaiNumber} onChange={updateText("fssaiNumber")} />
+          <FileField label="FSSAI File *" file={form.fssaiFile} onChange={updateFile("fssaiFile")} />
+          <Field label="GST Number *" placeholder="Enter GST number" value={form.gstNumber} onChange={updateText("gstNumber")} />
+          <FileField label="GST File *" file={form.gstFile} onChange={updateFile("gstFile")} />
+        </div>
+        {message ? <p className="whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
+        <div className="flex justify-end">
+          <button className="h-12 rounded-md bg-[#8D0606] px-8 font-semibold text-white disabled:opacity-60" disabled={saving} type="submit">
+            {saving ? "Submitting..." : "Submit Onboarding"}
+          </button>
+        </div>
+      </form>
+    </Card>
+  );
+}
+
+function FileField({ label, file, onChange }) {
+  return (
+    <label className="block">
+      <span className="mb-3 block text-sm font-semibold">{label}</span>
+      <span className="flex h-12 items-center gap-3 rounded border border-[#dce1e7] bg-white px-4">
+        <Upload size={18} className="text-[#8D0606]" />
+        <input className="min-w-0 flex-1 text-sm file:mr-4 file:rounded file:border-0 file:bg-[#fff1f1] file:px-3 file:py-1.5 file:font-bold file:text-[#8D0606]" type="file" onChange={onChange} />
+      </span>
+      {file ? <span className="mt-2 block text-xs font-semibold text-[#2f8f4e]">{file.name}</span> : null}
+    </label>
+  );
+}
+
+function SubscriptionPlansPage({ plans, onPlanSelected }) {
+  const [selectedPlanId, setSelectedPlanId] = useState(plans[0]?.id ? String(plans[0].id) : "");
+  const [billingCycle, setBillingCycle] = useState("MONTHLY");
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!selectedPlanId && plans[0]?.id) setSelectedPlanId(String(plans[0].id));
+  }, [plans, selectedPlanId]);
+
+  const selectPlan = async (plan) => {
+    setSelectedPlanId(String(plan.id));
+    setSaving(true);
+    setMessage("");
+    try {
+      await api.selectPlan({
+        subscriptionId: Number(plan.id),
+        billingCycle: plan.billingCycle || billingCycle,
+        duration: Number(plan.duration || plan.durationInMonths || 1),
+      });
+      await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle });
+    } catch (error) {
+      setMessage(getApiErrorMessage(error, "Unable to select subscription plan"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="p-8">
+      <div className="mb-7 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h2 className="text-3xl font-semibold text-[#8D0606]">Subscription Plans</h2>
+          <p className="mt-2 text-base text-[#777]">Select one plan to continue to ingredient setup.</p>
+        </div>
+        <div className="flex rounded-md border border-[#ececec] p-1 text-sm font-bold">
+          {["MONTHLY", "YEARLY"].map((cycle) => (
+            <button key={cycle} className={`rounded px-4 py-2 ${billingCycle === cycle ? "bg-[#8D0606] text-white" : "text-[#777]"}`} onClick={() => setBillingCycle(cycle)} type="button">{cycle}</button>
+          ))}
+        </div>
+      </div>
+
+      {plans.length ? (
+        <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
+          {plans.map((plan) => {
+            const active = String(plan.id) === selectedPlanId;
+            return (
+              <article key={plan.id || getPlanTitle(plan)} className={`rounded-md border bg-white p-6 shadow-sm ${active ? "border-[#8D0606]" : "border-[#ececec]"}`}>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-xl font-semibold">{getPlanTitle(plan)}</h3>
+                    <p className="mt-2 text-2xl font-bold text-[#8D0606]">{getPlanPrice(plan)}</p>
+                  </div>
+                  {active ? <span className="rounded-full bg-[#fff1f1] px-3 py-1 text-xs font-bold text-[#8D0606]">Selected</span> : null}
+                </div>
+                <p className="mt-4 min-h-[48px] text-sm leading-6 text-[#777]">{plan.description || plan.shortDescription || "Kitchen subscription plan"}</p>
+                <div className="mt-5 grid gap-2 text-sm text-[#555]">
+                  <span>Duration: {plan.duration || plan.durationInMonths || 1}</span>
+                  <span>Cycle: {plan.billingCycle || billingCycle}</span>
+                  <span>Status: {plan.status || "Available"}</span>
+                </div>
+                <button className="mt-6 h-11 w-full rounded-md bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={saving} onClick={() => selectPlan(plan)} type="button">
+                  {saving && active ? "Selecting..." : "Select Plan"}
+                </button>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">No subscription plans returned from API.</div>
+      )}
+      {message ? <p className="mt-5 whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
+    </Card>
+  );
+}
+
+function IngredientSetupPage({ apiState, refreshKitchenData, selectedPlan }) {
+  const branchOptions = apiState?.branches?.map((branch) => ({ value: branch.id, label: branch.name || `Branch ${branch.id}` })) || [];
+  const firstBranchId = branchOptions[0]?.value ? String(branchOptions[0].value) : "";
+  const [form, setForm] = useState({ branchId: firstBranchId, ingredientId: "", unit: "KG", name: "", category: "", image: "" });
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+  const updateForm = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.value }));
+
+  useEffect(() => {
+    setForm((current) => ({ ...current, branchId: current.branchId || firstBranchId }));
+  }, [firstBranchId]);
+
+  const addMasterIngredient = async (ingredient) => {
+    if (!form.branchId) {
+      setMessage("Create a branch first, then add ingredients to it.");
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    try {
+      await api.createBranchIngredients(form.branchId, { ingredients: [{ id: Number(ingredient.id), unit: ingredient.unit || form.unit || "KG" }] });
+      await refreshKitchenData?.();
+      setMessage(`${ingredient.name || "Ingredient"} added to branch.`);
+    } catch (error) {
+      setMessage(getApiErrorMessage(error, "Unable to add ingredient"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const submitManual = async (event) => {
+    event.preventDefault();
+    if (!form.branchId) {
+      setMessage("Create a branch first, then add ingredients to it.");
+      return;
+    }
+    if (!form.ingredientId && !form.name) {
+      setMessage("Select a master ingredient or enter a manual ingredient name.");
+      return;
+    }
+    setSaving(true);
+    setMessage("");
+    try {
+      const ingredient = form.ingredientId
+        ? { id: Number(form.ingredientId), unit: form.unit || "KG" }
+        : { name: form.name, category: form.category || "General", image: form.image || "", unit: form.unit || "KG" };
+      await api.createBranchIngredients(form.branchId, { ingredients: [ingredient] });
+      await refreshKitchenData?.();
+      setMessage("Ingredient saved successfully.");
+      setForm((current) => ({ ...current, ingredientId: "", name: "", category: "", image: "" }));
+    } catch (error) {
+      setMessage(getApiErrorMessage(error, "Unable to save ingredient"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const ingredientOptions = apiState?.ingredients?.map((ingredient) => ({ value: ingredient.id, label: ingredient.name || `Ingredient ${ingredient.id}` })) || [];
+
+  return (
+    <div className="mx-auto max-w-[1180px] space-y-7">
+      <div className="grid gap-5 md:grid-cols-3">
+        <ApiCount label="Selected Plan" value={selectedPlan ? getPlanTitle(selectedPlan) : "Active"} />
+        <ApiCount label="Master Data" value={apiState?.ingredients?.length || 0} />
+        <ApiCount label="Branch Ingredients" value={apiState?.branchIngredients?.length || 0} />
+      </div>
+
+      <div className="grid gap-7 xl:grid-cols-[1fr_420px]">
+        <Card className="overflow-hidden p-8">
+          <CardTitle title="Master Data List" subtitle="Choose ingredients from master data and add them to the selected branch." />
+          <div className="mt-6 overflow-x-auto">
+            <table className="w-full min-w-[720px] text-left">
+              <thead className="text-sm text-[#8D0606]">
+                <tr className="border-b border-[#ececec]">
+                  <th className="py-3">Ingredient</th>
+                  <th className="py-3">Category</th>
+                  <th className="py-3">Unit</th>
+                  <th className="py-3">Status</th>
+                  <th className="py-3 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(apiState?.ingredients || []).map((ingredient) => (
+                  <tr key={ingredient.id || ingredient.name} className="border-b border-[#f0f0f0]">
+                    <td className="py-4 font-semibold">{ingredient.name || `Ingredient ${ingredient.id}`}</td>
+                    <td className="py-4 text-[#777]">{ingredient.category || ingredient.categoryName || "General"}</td>
+                    <td className="py-4 text-[#777]">{ingredient.unit || "KG"}</td>
+                    <td className="py-4"><span className="rounded-full bg-[#e9f9ef] px-3 py-1 text-xs font-bold text-[#22a752]">{ingredient.status || "ACTIVE"}</span></td>
+                    <td className="py-4 text-right">
+                      <button className="rounded-md bg-[#fff1f1] px-4 py-2 text-sm font-bold text-[#8D0606] disabled:opacity-60" disabled={saving} onClick={() => addMasterIngredient(ingredient)} type="button">Add</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {apiState?.ingredients?.length ? null : <p className="py-8 text-center text-sm font-semibold text-[#777]">No master ingredients available.</p>}
+          </div>
+        </Card>
+
+        <Card className="p-8">
+          <CardTitle title="Manual Form" subtitle="Add a selected master ingredient or enter a custom ingredient." />
+          <form className="mt-6 grid gap-4" onSubmit={submitManual}>
+            <Field label="Branch" select value={form.branchId} onChange={updateForm("branchId")} options={branchOptions} placeholder={branchOptions.length ? "" : "No branch available"} />
+            <Field label="Master Ingredient" select value={form.ingredientId} onChange={updateForm("ingredientId")} options={ingredientOptions} placeholder="Select from master data" />
+            <Field label="Manual Ingredient Name" placeholder="Eg: Tomato" value={form.name} onChange={updateForm("name")} />
+            <Field label="Category" placeholder="Eg: Vegetable" value={form.category} onChange={updateForm("category")} />
+            <Field label="Unit" placeholder="KG" value={form.unit} onChange={updateForm("unit")} />
+            <Field label="Image URL" placeholder="https://..." value={form.image} onChange={updateForm("image")} />
+            <button className="h-12 rounded-md bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={saving} type="submit">{saving ? "Saving..." : "Save Ingredient"}</button>
+          </form>
+          {message ? <p className="mt-4 whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
+        </Card>
+      </div>
+    </div>
+  );
+}
 function DashboardPage({ setPage, apiState }) {
   return (
     <div className="mx-auto max-w-[1320px] space-y-7">
@@ -1448,9 +1827,8 @@ function KitchenApiActions({ apiState, setPage, refreshKitchenData, compact = fa
       label: "Create Branch",
       disabled: !apiState.token,
       onClick: () =>
-        run("Create Branch", async () => {
-          await ensureKitchenSetup(firstPlanId);
-          return api.createBranch({
+        run("Create Branch", () =>
+          api.createBranch({
             name: `Main Branch ${Date.now().toString().slice(-4)}`,
             addressLine1: "Shop No 12, Ground Floor",
             pincode: "201301",
@@ -1462,8 +1840,8 @@ function KitchenApiActions({ apiState, setPage, refreshKitchenData, compact = fa
             contactEmail: "rahul@example.com",
             contactPhone: "9876543210",
             cuisines: [{ id: Number(firstCuisineId) }],
-          });
-        }),
+          })
+        ),
     },
     {
       label: "Add Ingredients",
@@ -2030,8 +2408,11 @@ function KitchenFormPage({ setPage, apiState, refreshKitchenData }) {
     setSaving(true);
     setMessage("");
     try {
-      setMessage("Checking onboarding and subscription...");
-      await ensureKitchenSetup(apiState?.plans?.[0]?.id || 1);
+      if (!isKitchenOnboardingCompleted(apiState?.kitchen) || !hasSelectedSubscription(apiState)) {
+        setMessage("Complete onboarding and select a subscription plan before saving branch.");
+        setSaving(false);
+        return;
+      }
       const payload = {
         name: form.name,
         brand: form.brand,
