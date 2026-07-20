@@ -1470,14 +1470,42 @@ function FileField({ label, file, onChange }) {
 }
 
 function SubscriptionPlansPage({ plans, onPlanSelected }) {
-  const [selectedPlanId, setSelectedPlanId] = useState(plans[0]?.id ? String(plans[0].id) : "");
+  const [planList, setPlanList] = useState(Array.isArray(plans) ? plans : []);
+  const [selectedPlanId, setSelectedPlanId] = useState(planList[0]?.id ? String(planList[0].id) : "");
   const [billingCycle, setBillingCycle] = useState("MONTHLY");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!selectedPlanId && plans[0]?.id) setSelectedPlanId(String(plans[0].id));
-  }, [plans, selectedPlanId]);
+    let active = true;
+    async function loadPlans() {
+      setLoading(true);
+      setMessage("");
+      try {
+        const response = await api.plans();
+        const apiPlans = Array.isArray(response?.data) ? response.data : [];
+        if (!active) return;
+        setPlanList(apiPlans);
+        setSelectedPlanId((current) => current || (apiPlans[0]?.id ? String(apiPlans[0].id) : ""));
+      } catch (error) {
+        if (active) setMessage(getApiErrorMessage(error, "Unable to load subscription plans"));
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    loadPlans();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (Array.isArray(plans) && plans.length) {
+      setPlanList(plans);
+      setSelectedPlanId((current) => current || String(plans[0].id || ""));
+    }
+  }, [plans]);
 
   const selectPlan = async (plan) => {
     setSelectedPlanId(String(plan.id));
@@ -1491,7 +1519,12 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
       });
       await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle });
     } catch (error) {
-      setMessage(getApiErrorMessage(error, "Unable to select subscription plan"));
+      const messageText = getApiErrorMessage(error, "Unable to select subscription plan");
+      if (messageText.toLowerCase().includes("active subscription already exists")) {
+        await onPlanSelected?.({ ...plan, billingCycle: plan.billingCycle || billingCycle, alreadyActive: true });
+        return;
+      }
+      setMessage(messageText);
     } finally {
       setSaving(false);
     }
@@ -1502,7 +1535,7 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
       <div className="mb-7 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-3xl font-semibold text-[#8D0606]">Subscription Plans</h2>
-          <p className="mt-2 text-base text-[#777]">Select one plan to continue to ingredient setup.</p>
+          <p className="mt-2 text-base text-[#777]">Plans are loaded from the subscription listing API. Select one plan to continue.</p>
         </div>
         <div className="flex rounded-md border border-[#ececec] p-1 text-sm font-bold">
           {["MONTHLY", "YEARLY"].map((cycle) => (
@@ -1511,9 +1544,11 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
         </div>
       </div>
 
-      {plans.length ? (
+      {loading ? (
+        <div className="rounded-md border border-dashed border-[#d8d8d8] p-8 text-center text-[#777]">Loading subscription plans...</div>
+      ) : planList.length ? (
         <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-          {plans.map((plan) => {
+          {planList.map((plan) => {
             const active = String(plan.id) === selectedPlanId;
             return (
               <article key={plan.id || getPlanTitle(plan)} className={`rounded-md border bg-white p-6 shadow-sm ${active ? "border-[#8D0606]" : "border-[#ececec]"}`}>
