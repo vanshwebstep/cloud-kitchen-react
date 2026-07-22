@@ -74,6 +74,27 @@ function createProfileFile(name = "profile.txt") {
   return new File([new Blob(["profile"], { type: "text/plain" })], name, { type: "text/plain" });
 }
 
+const SELECTED_BRANCH_KEY = "cloudKitchenSelectedBranchId";
+
+function getStoredSelectedBranchId() {
+  return localStorage.getItem(SELECTED_BRANCH_KEY) || "";
+}
+
+function setStoredSelectedBranchId(branchId) {
+  if (branchId) localStorage.setItem(SELECTED_BRANCH_KEY, String(branchId));
+  else localStorage.removeItem(SELECTED_BRANCH_KEY);
+}
+
+function getBranchLabel(branch) {
+  return branch?.name || branch?.branchName || `Branch ${branch?.id || ""}`;
+}
+
+function resolveSelectedBranchId(branches = [], selectedBranchId = "") {
+  if (!branches.length) return "";
+  const current = branches.find((branch) => String(branch.id) === String(selectedBranchId));
+  return String((current || branches[0]).id);
+}
+
 
 const foodImages = [
   foodCollage,
@@ -188,16 +209,38 @@ function getKitchenSubscription(kitchen) {
   );
 }
 
+function getKitchenSubscriptionRecords(kitchen) {
+  if (!kitchen) return [];
+  return [
+    kitchen.activeSubscription,
+    kitchen.currentSubscription,
+    kitchen.subscription,
+    kitchen.subscriptionPlan,
+    kitchen.kitchenSubscription,
+    kitchen.selectedSubscription,
+    ...(Array.isArray(kitchen.subscriptions) ? kitchen.subscriptions : []),
+    ...(Array.isArray(kitchen.activeSubscriptions) ? kitchen.activeSubscriptions : []),
+    ...(Array.isArray(kitchen.kitchenSubscriptions) ? kitchen.kitchenSubscriptions : []),
+  ].filter(Boolean);
+}
+
+function isActiveSubscriptionRecord(subscription) {
+  if (!subscription) return false;
+  const status = String(subscription.status || subscription.subscriptionStatus || subscription.state || '').toUpperCase();
+  return status === 'ACTIVE' || truthyFlag(subscription.isActive ?? subscription.active ?? subscription.isCurrent ?? subscription.current);
+}
+
+function hasActiveKitchenSubscription(kitchen) {
+  return getKitchenSubscriptionRecords(kitchen).some(isActiveSubscriptionRecord);
+}
+
 function hasSelectedSubscription(apiState) {
   const kitchen = apiState?.kitchen || {};
   const selectedPlan = apiState?.selectedPlan;
-  const subscription = getKitchenSubscription(kitchen);
-  const subscriptions = Array.isArray(kitchen.subscriptions) ? kitchen.subscriptions : [];
   return Boolean(
     selectedPlan?.confirmedActive ||
     selectedPlan?.alreadyActive ||
-    String(subscription?.status || "").toUpperCase() === "ACTIVE" ||
-    subscriptions.some((item) => String(item?.status || "").toUpperCase() === "ACTIVE")
+    hasActiveKitchenSubscription(kitchen)
   );
 }
 
@@ -238,52 +281,60 @@ function App() {
     countries: [],
     states: [],
     cities: [],
+    selectedBranchId: getStoredSelectedBranchId(),
     selectedPlan: null,
     loading: true,
   });
 
   const updateApiState = (patch) => setApiState((current) => ({ ...current, ...patch }));
 
-  const refreshKitchenData = async (token = apiState.token, kitchen = apiState.kitchen) => {
-    if (!token) return;
+  const refreshKitchenData = async (token = apiState.token, kitchen = apiState.kitchen, branchIdOverride = "") => {
+    if (!token) return { subscriptionUnlocked: false };
     if (kitchen?.isOnboardingCompleted === false) {
       updateApiState({
         branches: [],
         menus: [],
         branchIngredients: [],
         stocks: [],
+        selectedBranchId: "",
         message: "Complete onboarding first, then select a plan to enable branch APIs.",
       });
-      return;
+      setStoredSelectedBranchId("");
+      return { subscriptionUnlocked: false, setupStep: "onboarding" };
     }
     try {
       const branchesResponse = await api.branches();
       const branches = Array.isArray(branchesResponse?.data) ? branchesResponse.data : [];
+      const selectedBranchId = resolveSelectedBranchId(branches, branchIdOverride || apiState.selectedBranchId || getStoredSelectedBranchId());
+      setStoredSelectedBranchId(selectedBranchId);
       let menus = [];
       let branchIngredients = [];
       let stocks = [];
-      const firstBranchId = branches[0]?.id;
-      if (firstBranchId) {
+      if (selectedBranchId) {
         try {
-          const menuResponse = await api.menus(firstBranchId);
+          const menuResponse = await api.menus(selectedBranchId);
           menus = Array.isArray(menuResponse?.data) ? menuResponse.data : [];
         } catch (error) {
           menus = [];
         }
         try {
-          const ingredientResponse = await api.branchIngredients(firstBranchId);
+          const ingredientResponse = await api.branchIngredients(selectedBranchId);
           branchIngredients = Array.isArray(ingredientResponse?.data) ? ingredientResponse.data : [];
         } catch (error) {
           branchIngredients = [];
         }
         try {
-          const stockResponse = await api.stocks(firstBranchId);
+          const stockResponse = await api.stocks(selectedBranchId);
           stocks = Array.isArray(stockResponse?.data) ? stockResponse.data : [];
         } catch (error) {
           stocks = [];
         }
       }
-      updateApiState({ branches, menus, branchIngredients, stocks });
+      const selectedPlan = hasActiveKitchenSubscription(kitchen)
+        ? apiState.selectedPlan
+        : apiState.selectedPlan || { alreadyActive: true, confirmedActive: true, name: "Active Subscription" };
+      updateApiState({ branches, menus, branchIngredients, stocks, selectedBranchId, selectedPlan });
+      return { subscriptionUnlocked: true, branches };
     } catch (error) {
       const message = getApiErrorMessage(error, "Kitchen APIs need login/onboarding/subscription");
       const setupMessage = message.toLowerCase().includes("onboarding")
@@ -291,10 +342,11 @@ function App() {
         : message.toLowerCase().includes("subscription")
           ? "Select a subscription plan to enable branch APIs."
           : message;
-      updateApiState({ branches: [], menus: [], branchIngredients: [], stocks: [], message: setupMessage });
+      updateApiState({ branches: [], menus: [], branchIngredients: [], stocks: [], selectedBranchId: "", message: setupMessage });
+      setStoredSelectedBranchId("");
+      return { subscriptionUnlocked: false, message: setupMessage };
     }
   };
-
   useEffect(() => {
     let mounted = true;
     async function boot() {
@@ -348,8 +400,20 @@ function App() {
     setStoredToken(token);
     updateApiState({ token, kitchen, online: true, message: "Logged in" });
     setDesktopAuthMode("login");
-    setPage(isKitchenOnboardingCompleted(kitchen) ? "Subscription Plans" : "Onboarding");
-    await refreshKitchenData(token, kitchen);
+    if (!isKitchenOnboardingCompleted(kitchen)) {
+      setPage("Onboarding");
+      await refreshKitchenData(token, kitchen);
+      return response;
+    }
+
+    const verifiedKitchen = await reloadKitchenProfile(kitchen || {});
+    const refreshResult = await refreshKitchenData(token, verifiedKitchen);
+    const existingSubscription = hasActiveKitchenSubscription(verifiedKitchen) || refreshResult?.subscriptionUnlocked;
+    updateApiState({
+      selectedPlan: existingSubscription ? { alreadyActive: true, confirmedActive: true, name: "Active Subscription" } : null,
+      message: existingSubscription ? "Existing active subscription found." : "Select a subscription plan to continue.",
+    });
+    setPage(existingSubscription ? "Ingredient Add" : "Subscription Plans");
     return response;
   };
 
@@ -367,6 +431,32 @@ function App() {
     }
   };
 
+  const checkExistingSubscription = async () => {
+    const kitchen = await reloadKitchenProfile(apiState.kitchen || {});
+    if (hasActiveKitchenSubscription(kitchen)) {
+      updateApiState({
+        selectedPlan: { alreadyActive: true, confirmedActive: true, name: "Active Subscription" },
+        kitchen,
+        message: "Existing active subscription found.",
+      });
+      setPage("Ingredient Add");
+      await refreshKitchenData(apiState.token, kitchen);
+      return true;
+    }
+
+    const refreshResult = await refreshKitchenData(apiState.token, kitchen);
+    if (refreshResult?.subscriptionUnlocked) {
+      updateApiState({
+        selectedPlan: { alreadyActive: true, confirmedActive: true, name: "Active Subscription" },
+        kitchen,
+        message: "Existing active subscription found.",
+      });
+      setPage("Ingredient Add");
+      return true;
+    }
+    return false;
+  };
+
   const handleOnboardingCompleted = async () => {
     const kitchen = await reloadKitchenProfile({ isOnboardingCompleted: true });
     updateApiState({ message: "Onboarding completed. Select a subscription plan." });
@@ -375,14 +465,27 @@ function App() {
 
   const handlePlanSelected = async (plan) => {
     const kitchen = await reloadKitchenProfile({});
-    updateApiState({ selectedPlan: { ...plan, confirmedActive: true }, kitchen, message: "Subscription plan selected." });
+    const selectedPlan = { ...plan, confirmedActive: Boolean(plan?.confirmedActive), alreadyActive: Boolean(plan?.alreadyActive) };
+    updateApiState({
+      selectedPlan,
+      kitchen,
+      message: selectedPlan.alreadyActive ? "Existing active subscription found." : "Subscription plan selected.",
+    });
     setPage("Ingredient Add");
     await refreshKitchenData(apiState.token, kitchen);
   };
 
+  const handleBranchChange = async (branchId) => {
+    const selectedBranchId = resolveSelectedBranchId(apiState.branches, branchId);
+    setStoredSelectedBranchId(selectedBranchId);
+    updateApiState({ selectedBranchId });
+    await refreshKitchenData(apiState.token, apiState.kitchen, selectedBranchId);
+  };
+
   const handleLogout = () => {
     setStoredToken("");
-    updateApiState({ token: "", kitchen: null, branches: [], menus: [], branchIngredients: [], stocks: [], selectedPlan: null, message: "Logged out" });
+    setStoredSelectedBranchId("");
+    updateApiState({ token: "", kitchen: null, branches: [], menus: [], branchIngredients: [], stocks: [], selectedBranchId: "", selectedPlan: null, message: "Logged out" });
     setPage("Dashboard");
     setDesktopAuthMode("login");
     setToast("Logged out");
@@ -416,12 +519,13 @@ function App() {
             onLogout={handleLogout}
             onOnboardingCompleted={handleOnboardingCompleted}
             onPlanSelected={handlePlanSelected}
+            onCheckExistingSubscription={checkExistingSubscription}
           />
         ) : (
           <>
             <Sidebar page={visiblePage} setPage={setPage} />
             <main className="min-w-0 flex-1 lg:pl-[300px]">
-              <Topbar title={visiblePage} apiState={apiState} onLogout={handleLogout} setPage={setPage} onToast={setToast} onLogin={handleLogin} refreshKitchenData={refreshKitchenData} />
+              <Topbar title={visiblePage} apiState={apiState} onLogout={handleLogout} setPage={setPage} onToast={setToast} onLogin={handleLogin} refreshKitchenData={refreshKitchenData} onBranchChange={handleBranchChange} />
               <div className="page-shell px-5 py-7 sm:px-8 lg:px-10">
                 {visiblePage === "Analytics" ? (
                   <AnalyticsPage setPage={setPage} />
@@ -532,6 +636,11 @@ function DesktopAuthPage({ mode, setMode, onLogin }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
+  const switchMode = (nextMode) => {
+    setMode(nextMode);
+    setMessage("");
+  };
+
   const submitLogin = async (event) => {
     event.preventDefault();
     setBusy(true);
@@ -558,7 +667,7 @@ function DesktopAuthPage({ mode, setMode, onLogin }) {
         profilePicture: createProfileFile("desktop-profile.txt"),
       });
       setMessage("Registration complete. Login with your email/phone.");
-      setMode("login");
+      switchMode("login");
     } catch (error) {
       setMessage(getApiErrorMessage(error, "Registration failed"));
     } finally {
@@ -588,7 +697,7 @@ function DesktopAuthPage({ mode, setMode, onLogin }) {
     try {
       await api.resetPassword({ token: forgotForm.token, password: forgotForm.password, confirmPassword: forgotForm.confirmPassword });
       setMessage("Password reset successful. Login now.");
-      setMode("login");
+      switchMode("login");
     } catch (error) {
       setMessage(getApiErrorMessage(error, "Password reset failed"));
     } finally {
@@ -606,19 +715,16 @@ function DesktopAuthPage({ mode, setMode, onLogin }) {
             <p className="mt-1 text-sm text-[#777]">Login to manage your kitchen data.</p>
           </div>
         </div>
-        <div className="mb-6 grid grid-cols-3 rounded-full bg-[#f3f3f3] p-1 text-sm font-bold">
-          {["login", "register", "forgot"].map((tab) => (
-            <button key={tab} className={`rounded-full py-2 capitalize ${mode === tab ? "bg-[#8D0606] text-white" : "text-[#777]"}`} onClick={() => { setMode(tab); setMessage(""); }} type="button">
-              {tab}
-            </button>
-          ))}
-        </div>
 
-        {mode === "login" ? (
-          <form className="space-y-4" onSubmit={submitLogin}>
-            <Field label="Email / Phone" placeholder="Enter email or phone" value={loginForm.username} onChange={(e) => setLoginForm((f) => ({ ...f, username: e.target.value }))} />
-            <Field label="Password" placeholder="Enter password" type="password" value={loginForm.password} onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))} />
-            <button className="h-12 w-full rounded-lg bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">{busy ? "Logging in..." : "Login"}</button>
+        {mode === "forgot" ? (
+          <form className="space-y-4" onSubmit={submitReset}>
+            <Field label="Email / Phone" placeholder="Enter email or phone" value={forgotForm.username} onChange={(e) => setForgotForm((f) => ({ ...f, username: e.target.value }))} />
+            <button className="h-11 w-full rounded-lg bg-[#fff1f1] font-bold text-[#8D0606]" disabled={busy || !forgotForm.username} onClick={requestReset} type="button">Request Reset Token</button>
+            <Field label="Reset Token" placeholder="Token from email/backend response" value={forgotForm.token} onChange={(e) => setForgotForm((f) => ({ ...f, token: e.target.value }))} />
+            <Field label="New Password" type="password" value={forgotForm.password} onChange={(e) => setForgotForm((f) => ({ ...f, password: e.target.value }))} />
+            <Field label="Confirm Password" type="password" value={forgotForm.confirmPassword} onChange={(e) => setForgotForm((f) => ({ ...f, confirmPassword: e.target.value }))} />
+            <button className="h-12 w-full rounded-lg bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">{busy ? "Saving..." : "Reset Password"}</button>
+            <button className="w-full text-center text-xs text-[#777]" onClick={() => switchMode("login")} type="button">Back to Login</button>
           </form>
         ) : mode === "register" ? (
           <form className="grid gap-4 md:grid-cols-2" onSubmit={submitRegister}>
@@ -629,15 +735,19 @@ function DesktopAuthPage({ mode, setMode, onLogin }) {
             <Field label="Contact First Name" value={registerForm.contactFirstName} onChange={(e) => setRegisterForm((f) => ({ ...f, contactFirstName: e.target.value }))} />
             <Field label="Contact Last Name" value={registerForm.contactLastName} onChange={(e) => setRegisterForm((f) => ({ ...f, contactLastName: e.target.value }))} />
             <button className="h-12 rounded-lg bg-[#8D0606] font-semibold text-white disabled:opacity-60 md:col-span-2" disabled={busy} type="submit">{busy ? "Creating..." : "Register"}</button>
+            <button className="text-center text-xs text-[#777] md:col-span-2" onClick={() => switchMode("login")} type="button">Already have an account? Login</button>
           </form>
         ) : (
-          <form className="space-y-4" onSubmit={submitReset}>
-            <Field label="Email / Phone" placeholder="Enter email or phone" value={forgotForm.username} onChange={(e) => setForgotForm((f) => ({ ...f, username: e.target.value }))} />
-            <button className="h-11 w-full rounded-lg bg-[#fff1f1] font-bold text-[#8D0606]" disabled={busy || !forgotForm.username} onClick={requestReset} type="button">Request Reset Token</button>
-            <Field label="Reset Token" placeholder="Token from email/backend response" value={forgotForm.token} onChange={(e) => setForgotForm((f) => ({ ...f, token: e.target.value }))} />
-            <Field label="New Password" type="password" value={forgotForm.password} onChange={(e) => setForgotForm((f) => ({ ...f, password: e.target.value }))} />
-            <Field label="Confirm Password" type="password" value={forgotForm.confirmPassword} onChange={(e) => setForgotForm((f) => ({ ...f, confirmPassword: e.target.value }))} />
-            <button className="h-12 w-full rounded-lg bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">{busy ? "Saving..." : "Reset Password"}</button>
+          <form className="space-y-4" onSubmit={submitLogin}>
+            <Field label="Email / Phone" placeholder="Enter email or phone" value={loginForm.username} onChange={(e) => setLoginForm((f) => ({ ...f, username: e.target.value }))} />
+            <Field label="Password" placeholder="Enter password" type="password" value={loginForm.password} onChange={(e) => setLoginForm((f) => ({ ...f, password: e.target.value }))} />
+            <div className="flex justify-end">
+              <button className="text-xs font-bold text-[#8D0606]" onClick={() => switchMode("forgot")} type="button">Forgot Password?</button>
+            </div>
+            <button className="h-12 w-full rounded-lg bg-[#8D0606] font-semibold text-white disabled:opacity-60" disabled={busy} type="submit">{busy ? "Logging in..." : "Login"}</button>
+            <div className="flex justify-end">
+              <button className="text-xs text-[#777]" onClick={() => switchMode("register")} type="button">New user? <span className="font-bold text-[#8D0606]">Register</span></button>
+            </div>
           </form>
         )}
         {message ? <p className="mt-5 whitespace-pre-line text-sm font-bold text-[#8D0606]">{message}</p> : null}
@@ -1171,7 +1281,7 @@ function MobileBottomNav({ setScreen, active }) {
   );
 }
 
-function Topbar({ title, apiState, onLogout, setPage, onToast, onLogin, refreshKitchenData }) {
+function Topbar({ title, apiState, onLogout, setPage, onToast, onLogin, refreshKitchenData, onBranchChange }) {
   const [openPanel, setOpenPanel] = useState("");
   const [resetOpen, setResetOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1192,6 +1302,7 @@ function Topbar({ title, apiState, onLogout, setPage, onToast, onLogin, refreshK
         <h1 className="text-[38px] font-semibold tracking-[-0.03em]">{title}</h1>
       </div>
       <div className="flex items-center gap-6">
+        <BranchHeaderSelect apiState={apiState} onBranchChange={onBranchChange} setPage={setPage} />
         <div className="hidden items-center gap-5 md:flex">
           {topAlerts.map((alert, index) => {
             const key = ["notifications", "messages", "gifts"][index];
@@ -1243,6 +1354,7 @@ function Topbar({ title, apiState, onLogout, setPage, onToast, onLogin, refreshK
       {openPanel === "profile" ? (
         <ProfilePanel
           apiState={apiState}
+          onBranchChange={onBranchChange}
           onClose={() => setOpenPanel("")}
           onLogout={onLogout}
           onReset={() => {
@@ -1298,9 +1410,49 @@ function HeaderPanel({ title, items, onClose, onAction }) {
   );
 }
 
-function ProfilePanel({ apiState, onClose, onLogout, onReset, onBackend, setPage }) {
+function BranchHeaderSelect({ apiState, onBranchChange, setPage }) {
+  const branches = apiState?.branches || [];
+  const selectedBranchId = resolveSelectedBranchId(branches, apiState?.selectedBranchId);
+
+  if (!branches.length) {
+    return (
+      <button className="hidden rounded-md border border-[#f0d5d5] bg-[#fff8f8] px-4 py-3 text-left text-sm font-bold text-[#8D0606] lg:block" onClick={() => setPage("Add / Edit Kitchen")} type="button">
+        + Add Branch
+      </button>
+    );
+  }
+
   return (
-    <div className="absolute right-10 top-24 z-40 w-[360px] rounded-xl bg-white p-5 shadow-[0_16px_40px_rgba(0,0,0,0.16)]">
+    <label className="hidden min-w-[230px] lg:block">
+      <span className="mb-1 block text-xs font-bold uppercase text-[#8D0606]">Branch</span>
+      <select
+        className="h-11 w-full rounded-md border border-[#eadcdc] bg-white px-3 text-sm font-semibold outline-none"
+        value={selectedBranchId}
+        onChange={(event) => onBranchChange?.(event.target.value)}
+      >
+        {branches.map((branch) => (
+          <option key={branch.id} value={branch.id}>{getBranchLabel(branch)}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+function ProfilePanel({ apiState, onBranchChange, onClose, onLogout, onReset, onBackend, setPage }) {
+  const branches = apiState?.branches || [];
+  const selectedBranchId = resolveSelectedBranchId(branches, apiState?.selectedBranchId);
+
+  const openAddBranch = () => {
+    onClose?.();
+    setPage("Add / Edit Kitchen");
+  };
+
+  const selectBranch = (branchId) => {
+    onBranchChange?.(branchId);
+    onClose?.();
+  };
+
+  return (
+    <div className="absolute right-10 top-24 z-40 w-[380px] rounded-xl bg-white p-5 shadow-[0_16px_40px_rgba(0,0,0,0.16)]">
       <div className="mb-4 flex items-start justify-between">
         <div className="flex gap-3">
           <div className="grid size-14 place-items-center rounded-full bg-[#4aa0ef] text-white"><UserRound fill="currentColor" /></div>
@@ -1312,8 +1464,36 @@ function ProfilePanel({ apiState, onClose, onLogout, onReset, onBackend, setPage
         </div>
         <button onClick={onClose} type="button"><X size={18} /></button>
       </div>
+
+      <div className="mb-4 rounded-lg border border-[#f0e0e0] bg-[#fffafa] p-3">
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <p className="text-sm font-bold text-[#8D0606]">Branch List</p>
+          <button className="text-xs font-bold text-[#8D0606]" onClick={openAddBranch} type="button">+ Add Branch</button>
+        </div>
+        {branches.length ? (
+          <div className="grid max-h-[190px] gap-2 overflow-y-auto pr-1">
+            {branches.map((branch, index) => {
+              const active = String(branch.id) === String(selectedBranchId);
+              return (
+                <button
+                  key={branch.id}
+                  className={`rounded-md px-3 py-2 text-left text-sm font-semibold ${active ? "bg-[#8D0606] text-white" : "bg-white text-[#333] hover:bg-[#fff1f1]"}`}
+                  onClick={() => selectBranch(branch.id)}
+                  type="button"
+                >
+                  <span className="block">{getBranchLabel(branch)}</span>
+                  <span className={`text-xs ${active ? "text-white/80" : "text-[#777]"}`}>{index === 0 ? "Default branch" : `Branch ID: ${branch.id}`}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <button className="w-full rounded-md bg-[#8D0606] px-4 py-3 text-left text-sm font-semibold text-white" onClick={openAddBranch} type="button">Add first branch</button>
+        )}
+      </div>
+
       <div className="grid gap-2">
-        <button className="rounded-lg bg-[#f8f8f8] px-4 py-3 text-left font-bold" onClick={() => setPage("Add / Edit Kitchen")} type="button">Edit Kitchen Profile</button>
+        <button className="rounded-lg bg-[#f8f8f8] px-4 py-3 text-left font-bold" onClick={openAddBranch} type="button">Edit Kitchen Profile</button>
         <button className="rounded-lg bg-[#f8f8f8] px-4 py-3 text-left font-bold" onClick={onBackend} type="button">Backend Connection</button>
         <button className="rounded-lg bg-[#f8f8f8] px-4 py-3 text-left font-bold" onClick={onReset} type="button">Reset Password</button>
         <button className="rounded-lg bg-[#f8f8f8] px-4 py-3 text-left font-bold" onClick={() => setPage("Table")} type="button">Account Data</button>
@@ -1361,7 +1541,7 @@ function ResetPasswordModal({ onClose, onToast }) {
   );
 }
 
-function SetupFlowPage({ step, apiState, onLogout, onOnboardingCompleted, onPlanSelected }) {
+function SetupFlowPage({ step, apiState, onLogout, onOnboardingCompleted, onPlanSelected, onCheckExistingSubscription }) {
   return (
     <main className="min-h-screen flex-1 bg-[#F7F6F6] px-6 py-7">
       <div className="mx-auto flex max-w-[1180px] items-center justify-between rounded-md bg-white px-6 py-4 shadow-sm">
@@ -1387,7 +1567,7 @@ function SetupFlowPage({ step, apiState, onLogout, onOnboardingCompleted, onPlan
         {step === "onboarding" ? (
           <OnboardingPage onComplete={onOnboardingCompleted} />
         ) : (
-          <SubscriptionPlansPage plans={apiState?.plans || []} onPlanSelected={onPlanSelected} />
+          <SubscriptionPlansPage plans={apiState?.plans || []} onPlanSelected={onPlanSelected} onCheckExistingSubscription={onCheckExistingSubscription} />
         )}
       </div>
     </main>
@@ -1465,7 +1645,7 @@ function FileField({ label, file, onChange }) {
   );
 }
 
-function SubscriptionPlansPage({ plans, onPlanSelected }) {
+function SubscriptionPlansPage({ plans, onPlanSelected, onCheckExistingSubscription }) {
   const [planList, setPlanList] = useState(Array.isArray(plans) ? plans : []);
   const [selectedPlanId, setSelectedPlanId] = useState(planList[0]?.id ? String(planList[0].id) : "");
   const [paymentPlan, setPaymentPlan] = useState(null);
@@ -1506,10 +1686,24 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
     }
   }, [plans]);
 
-  const openPayment = (plan) => {
+  const openPayment = async (plan) => {
     setSelectedPlanId(String(plan.id));
-    setPaymentPlan(plan);
-    setMessage("");
+    setPaymentPlan(null);
+    setSaving(true);
+    setMessage("Checking active subscription...");
+    try {
+      const existingSubscription = await onCheckExistingSubscription?.();
+      if (existingSubscription) {
+        setMessage("Active subscription already exists. Opening ingredient setup with the existing subscription.");
+        return;
+      }
+      setPaymentPlan(plan);
+      setMessage("");
+    } catch (error) {
+      setMessage(getApiErrorMessage(error, "Unable to check active subscription"));
+    } finally {
+      setSaving(false);
+    }
   };
 
   const validateDemoPayment = () => {
@@ -1534,8 +1728,15 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
       return;
     }
     setSaving(true);
-    setMessage("Demo Stripe payment authorized. Activating subscription...");
+    setMessage("Checking active subscription...");
     try {
+      const existingSubscription = await onCheckExistingSubscription?.();
+      if (existingSubscription) {
+        setMessage("Active subscription already exists. Opening ingredient setup with the existing subscription.");
+        return;
+      }
+
+      setMessage("Demo Stripe payment authorized. Activating subscription...");
       await api.selectPlan({
         subscriptionId: Number(paymentPlan.id),
         billingCycle: paymentPlan.billingCycle || billingCycle,
@@ -1545,6 +1746,7 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
     } catch (error) {
       const messageText = getApiErrorMessage(error, "Unable to activate subscription plan");
       if (messageText.toLowerCase().includes("active subscription already exists")) {
+        setMessage("Active subscription already exists. Opening ingredient setup with the existing subscription.");
         await onPlanSelected?.({ ...paymentPlan, billingCycle: paymentPlan.billingCycle || billingCycle, alreadyActive: true, demoPayment: true });
         return;
       }
@@ -1559,7 +1761,7 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
       <div className="mb-7 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-3xl font-semibold text-[#8D0606]">Subscription Plans</h2>
-          <p className="mt-2 text-base text-[#777]">Select a plan, complete demo Stripe payment, then subscription record will be saved.</p>
+          <p className="mt-2 text-base text-[#777]">Select a plan, complete demo Stripe payment, then subscription record will be saved. Existing active subscriptions continue to ingredient setup.</p>
         </div>
         <div className="flex rounded-md border border-[#ececec] p-1 text-sm font-bold">
           {["MONTHLY", "YEARLY"].map((cycle) => (
@@ -1632,14 +1834,15 @@ function SubscriptionPlansPage({ plans, onPlanSelected }) {
 }
 function IngredientSetupPage({ apiState, refreshKitchenData, selectedPlan }) {
   const branchOptions = apiState?.branches?.map((branch) => ({ value: branch.id, label: branch.name || `Branch ${branch.id}` })) || [];
-  const firstBranchId = branchOptions[0]?.value ? String(branchOptions[0].value) : "";
+  const selectedBranchId = resolveSelectedBranchId(apiState?.branches || [], apiState?.selectedBranchId);
+  const firstBranchId = selectedBranchId || (branchOptions[0]?.value ? String(branchOptions[0].value) : "");
   const [form, setForm] = useState({ branchId: firstBranchId, ingredientId: "", unit: "KG", name: "", category: "", image: "" });
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const updateForm = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.value }));
 
   useEffect(() => {
-    setForm((current) => ({ ...current, branchId: current.branchId || firstBranchId }));
+    setForm((current) => ({ ...current, branchId: firstBranchId || current.branchId }));
   }, [firstBranchId]);
 
   const addMasterIngredient = async (ingredient) => {
@@ -1651,7 +1854,7 @@ function IngredientSetupPage({ apiState, refreshKitchenData, selectedPlan }) {
     setMessage("");
     try {
       await api.createBranchIngredients(form.branchId, { ingredients: [{ id: Number(ingredient.id), unit: ingredient.unit || form.unit || "KG" }] });
-      await refreshKitchenData?.();
+      await refreshKitchenData?.(undefined, undefined, form.branchId);
       setMessage(`${ingredient.name || "Ingredient"} added to branch.`);
     } catch (error) {
       setMessage(getApiErrorMessage(error, "Unable to add ingredient"));
@@ -1677,7 +1880,7 @@ function IngredientSetupPage({ apiState, refreshKitchenData, selectedPlan }) {
         ? { id: Number(form.ingredientId), unit: form.unit || "KG" }
         : { name: form.name, category: form.category || "General", image: form.image || "", unit: form.unit || "KG" };
       await api.createBranchIngredients(form.branchId, { ingredients: [ingredient] });
-      await refreshKitchenData?.();
+      await refreshKitchenData?.(undefined, undefined, form.branchId);
       setMessage("Ingredient saved successfully.");
       setForm((current) => ({ ...current, ingredientId: "", name: "", category: "", image: "" }));
     } catch (error) {
@@ -1853,7 +2056,7 @@ function KitchenApiActions({ apiState, setPage, refreshKitchenData, compact = fa
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
 
-  const firstBranchId = apiState.branches[0]?.id;
+  const firstBranchId = resolveSelectedBranchId(apiState.branches, apiState.selectedBranchId);
   const firstIngredientId =
     apiState.branchIngredients[0]?.ingredientId ||
     apiState.branchIngredients[0]?.id ||
@@ -2210,7 +2413,7 @@ function ReviewCard({ review, index }) {
 }
 
 function AddMenuPage({ setPage, apiState, refreshKitchenData }) {
-  const firstBranchId = apiState?.branches?.[0]?.id ? String(apiState.branches[0].id) : "";
+  const firstBranchId = resolveSelectedBranchId(apiState?.branches || [], apiState?.selectedBranchId);
   const firstIngredientId =
     apiState?.branchIngredients?.[0]?.ingredientId ||
     apiState?.branchIngredients?.[0]?.ingredient?.id ||
@@ -2244,7 +2447,7 @@ function AddMenuPage({ setPage, apiState, refreshKitchenData }) {
   useEffect(() => {
     setForm((current) => ({
       ...current,
-      branchId: current.branchId || (apiState?.branches?.[0]?.id ? String(apiState.branches[0].id) : ""),
+      branchId: firstBranchId || current.branchId,
       ingredientId:
         current.ingredientId ||
         (apiState?.branchIngredients?.[0]?.ingredientId
@@ -2258,7 +2461,7 @@ function AddMenuPage({ setPage, apiState, refreshKitchenData }) {
     if (apiState?.branchIngredients?.length) {
       setBranchIngredients(apiState.branchIngredients);
     }
-  }, [apiState?.branches, apiState?.branchIngredients, apiState?.ingredients]);
+  }, [apiState?.branches, apiState?.selectedBranchId, apiState?.branchIngredients, apiState?.ingredients, firstBranchId]);
 
   useEffect(() => {
     if (!form.branchId) return;
@@ -2314,7 +2517,7 @@ function AddMenuPage({ setPage, apiState, refreshKitchenData }) {
         ingredients: [{ id: Number(form.ingredientId), quantity: Number(form.quantity) }],
       });
 
-      await refreshKitchenData?.();
+      await refreshKitchenData?.(undefined, undefined, form.branchId);
       setMessage("Menu item created successfully.");
       setPage("Category");
     } catch (error) {
@@ -2372,7 +2575,8 @@ function KitchenFormPage({ setPage, apiState, refreshKitchenData }) {
   const defaultCountryId = apiState?.countries?.[0]?.id ? String(apiState.countries[0].id) : "101";
   const kitchen = apiState?.kitchen || {};
   const branchList = apiState?.branches || [];
-  const [selectedBranchId, setSelectedBranchId] = useState(branchList[0]?.id ? String(branchList[0].id) : "new");
+  const activeBranchId = resolveSelectedBranchId(branchList, apiState?.selectedBranchId);
+  const [selectedBranchId, setSelectedBranchId] = useState(activeBranchId || "new");
   const selectedBranch = selectedBranchId === "new" ? null : branchList.find((branch) => String(branch.id) === String(selectedBranchId)) || null;
   const createBranchForm = (branch = null) => ({
     name: branch?.name || kitchen?.kitchenName || "",
@@ -2410,13 +2614,13 @@ function KitchenFormPage({ setPage, apiState, refreshKitchenData }) {
     : [{ value: form.cityId, label: `City #${form.cityId}` }];
 
   useEffect(() => {
-    if (selectedBranchId !== "new" && !selectedBranch && branchList[0]?.id) {
-      setSelectedBranchId(String(branchList[0].id));
+    if (selectedBranchId !== "new" && !selectedBranch && activeBranchId) {
+      setSelectedBranchId(activeBranchId);
     }
     if (selectedBranchId === "new" || selectedBranch) {
       setForm(createBranchForm(selectedBranch));
     }
-  }, [selectedBranchId, selectedBranch?.id, apiState?.branches, apiState?.kitchen]);
+  }, [selectedBranchId, selectedBranch?.id, apiState?.branches, apiState?.selectedBranchId, apiState?.kitchen, activeBranchId]);
 
   useEffect(() => {
     setForm((current) => ({
@@ -2516,12 +2720,14 @@ function KitchenFormPage({ setPage, apiState, refreshKitchenData }) {
         contactPhone: form.contactPhone,
         cuisines: [{ id: Number(form.cuisineId) }],
       };
+      let savedBranchId = selectedBranch?.id ? String(selectedBranch.id) : "";
       if (selectedBranch?.id) {
         await api.updateBranch(selectedBranch.id, payload);
       } else {
-        await api.createBranch(payload);
+        const createResponse = await api.createBranch(payload);
+        savedBranchId = createResponse?.data?.id ? String(createResponse.data.id) : "";
       }
-      await refreshKitchenData?.();
+      await refreshKitchenData?.(undefined, undefined, savedBranchId);
       setMessage(selectedBranch?.id ? "Branch updated successfully." : "Branch saved successfully.");
       setPage("Category");
     } catch (error) {
